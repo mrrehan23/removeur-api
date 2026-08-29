@@ -1,12 +1,24 @@
 services:
   - type: web
     name: removeur-api
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    runtime: docker
+    plan: starter
     healthCheckPath: /health
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.13
-      - key: REMOVEUR_INTERNAL_SECRET
+      - key: REMOVEUR_BACKEND_SECRET
         generateValue: true
+
+      - key: REMOVEUR_FRONTEND_ORIGIN
+        value: https://removeur.pages.dev
+
+      - key: DAILY_LIMIT
+        value: "50"
+
+      - key: RATE_LIMIT_PER_MINUTE
+        value: "5"
+
+      - key: MAX_UPLOAD_MB
+        value: "10"
+
+      - key: REMBG_MODEL
+        value: u2net
