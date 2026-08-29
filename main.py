@@ -1,171 +1,197 @@
+# main.py
+
 import io
 import os
-import secrets
-from typing import Optional
 
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
-from PIL import Image, UnidentifiedImageError
+from flask import Flask, jsonify, request, send_file
+from PIL import Image
 from rembg import remove
 
 
-app = FastAPI(
-    title="REMOVEUR Background Removal API",
-    version="1.0.0"
-)
-
-
-ALLOWED_ORIGINS = {
-    "https://removeur.pages.dev",
-    "https://removeur.com",
-    "https://www.removeur.com",
-}
-
-INTERNAL_SECRET = os.environ.get("REMOVEUR_INTERNAL_SECRET", "")
+app = Flask(__name__)
 
 MAX_FILE_SIZE = 10 * 1024 * 1024
-MAX_IMAGE_PIXELS = 25_000_000
 
-ALLOWED_CONTENT_TYPES = {
+ALLOWED_MIME_TYPES = {
     "image/jpeg",
     "image/png",
     "image/webp",
 }
 
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=list(ALLOWED_ORIGINS),
-    allow_credentials=False,
-    allow_methods=["POST", "GET", "OPTIONS"],
-    allow_headers=["Content-Type", "X-REMOVEUR-SECRET"],
-)
+EDGE_SECRET = os.environ.get("REMOVEUR_EDGE_SECRET", "")
 
 
 @app.get("/")
-async def root():
-    return {
-        "service": "REMOVEUR Background Removal API",
-        "status": "online",
-    }
+def root():
+    return jsonify({
+        "status": "healthy",
+        "service": "removeur-api"
+    })
 
 
 @app.get("/health")
-async def health():
-    return {
+def health():
+    return jsonify({
         "status": "healthy",
-        "service": "removeur-api",
-    }
+        "service": "removeur-api"
+    })
 
 
-def verify_origin(origin: Optional[str], referer: Optional[str]) -> bool:
-    if origin in ALLOWED_ORIGINS:
-        return True
+@app.post("/remove-background")
+def remove_background():
 
-    if referer:
-        for allowed_origin in ALLOWED_ORIGINS:
-            if referer.startswith(allowed_origin + "/"):
-                return True
+    if not EDGE_SECRET:
+        return jsonify({
+            "error": "Server security configuration is missing."
+        }), 500
 
-    return False
+    supplied_secret = request.headers.get(
+        "X-REMOVEUR-EDGE-SECRET",
+        ""
+    )
 
+    if supplied_secret != EDGE_SECRET:
+        return jsonify({
+            "error": "Unauthorized."
+        }), 401
 
-def verify_internal_secret(secret: Optional[str]) -> bool:
-    if not INTERNAL_SECRET:
-        return False
+    source_header = request.headers.get(
+        "X-REMOVEUR-SOURCE",
+        ""
+    )
 
-    if not secret:
-        return False
+    if source_header != "removeur-cloudflare":
+        return jsonify({
+            "error": "Unauthorized."
+        }), 401
 
-    return secrets.compare_digest(secret, INTERNAL_SECRET)
+    uploaded_file = request.files.get("image")
 
+    if uploaded_file is None:
+        return jsonify({
+            "error": "No image uploaded."
+        }), 400
 
-@app.post("/api/remove-background")
-async def remove_background(
-    file: UploadFile = File(...),
-    x_removeur_secret: Optional[str] = Header(default=None),
-    origin: Optional[str] = Header(default=None),
-    referer: Optional[str] = Header(default=None),
-):
-    if not verify_origin(origin, referer):
-        raise HTTPException(
-            status_code=403,
-            detail="Forbidden origin.",
-        )
+    if not uploaded_file.filename:
+        return jsonify({
+            "error": "Invalid filename."
+        }), 400
 
-    if not verify_internal_secret(x_removeur_secret):
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized request.",
-        )
+    content_type = (
+        uploaded_file.content_type or ""
+    ).lower()
 
-    if file.content_type not in ALLOWED_CONTENT_TYPES:
-        raise HTTPException(
-            status_code=415,
-            detail="Unsupported image format.",
-        )
+    if content_type not in ALLOWED_MIME_TYPES:
+        return jsonify({
+            "error":
+                "Only JPG, PNG and WebP images are supported."
+        }), 415
 
-    data = await file.read()
+    uploaded_file.stream.seek(0)
 
-    if not data:
-        raise HTTPException(
-            status_code=400,
-            detail="Empty file.",
-        )
+    raw_data = uploaded_file.stream.read(
+        MAX_FILE_SIZE + 1
+    )
 
-    if len(data) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail="Image exceeds the 10 MB limit.",
-        )
+    if len(raw_data) > MAX_FILE_SIZE:
+        return jsonify({
+            "error":
+                "Image is too large. Maximum allowed size is 10 MB."
+        }), 413
 
-    try:
-        image = Image.open(io.BytesIO(data))
-        image.load()
-
-        width, height = image.size
-
-        if width * height > MAX_IMAGE_PIXELS:
-            raise HTTPException(
-                status_code=413,
-                detail="Image resolution is too large.",
-            )
-
-    except HTTPException:
-        raise
-
-    except UnidentifiedImageError:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid image file.",
-        )
-
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Unable to read image.",
-        )
+    if not raw_data:
+        return jsonify({
+            "error": "Empty image."
+        }), 400
 
     try:
-        output = remove(data)
-
-    except Exception:
-        raise HTTPException(
-            status_code=500,
-            detail="Background removal failed.",
+        image = Image.open(
+            io.BytesIO(raw_data)
         )
 
-    finally:
-        del data
+        image.verify()
 
-    return Response(
-        content=output,
-        media_type="image/png",
-        headers={
-            "Content-Disposition": 'attachment; filename="removeur-result.png"',
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-            "X-Content-Type-Options": "nosniff",
-        },
+    except Exception:
+        return jsonify({
+            "error": "Invalid image file."
+        }), 400
+
+    try:
+        image = Image.open(
+            io.BytesIO(raw_data)
+        ).convert("RGBA")
+
+    except Exception:
+        return jsonify({
+            "error": "Unable to read image."
+        }), 400
+
+    try:
+        output = remove(image)
+
+    except Exception:
+        app.logger.exception(
+            "Background removal failed"
+        )
+
+        return jsonify({
+            "error":
+                "Background removal failed."
+        }), 500
+
+    output_buffer = io.BytesIO()
+
+    output.save(
+        output_buffer,
+        format="PNG",
+        optimize=True
+    )
+
+    output_buffer.seek(0)
+
+    return send_file(
+        output_buffer,
+        mimetype="image/png",
+        as_attachment=True,
+        download_name=(
+            "removeur-background-removed.png"
+        ),
+        max_age=0
+    )
+
+
+@app.errorhandler(413)
+def request_entity_too_large(_error):
+    return jsonify({
+        "error":
+            "Uploaded image is too large."
+    }), 413
+
+
+@app.errorhandler(404)
+def not_found(_error):
+    return jsonify({
+        "error": "Not found."
+    }), 404
+
+
+@app.errorhandler(500)
+def internal_error(_error):
+    return jsonify({
+        "error":
+            "Internal server error."
+    }), 500
+
+
+if __name__ == "__main__":
+    port = int(
+        os.environ.get(
+            "PORT",
+            "10000"
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
     )
